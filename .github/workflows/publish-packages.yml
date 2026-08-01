@@ -1,0 +1,108 @@
+name: Publish Runner Packages
+
+# Builds installable runner tarballs for this fork and publishes them as a
+# versioned GitHub release (v<runner version>-multi.<run number>) on every
+# merge to main, so a current build is always downloadable without rebuilding
+# locally. The stock Runner CD workflow (release.yml) is intentionally not
+# used: it requires editing the releaseVersion file and depends on archived
+# actions.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - main
+    paths-ignore:
+    - '**.md'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        runtime: [ osx-arm64, linux-arm64 ]
+        include:
+        - runtime: osx-arm64
+          os: macOS-latest
+
+        - runtime: linux-arm64
+          os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Build & Layout Release
+      run: |
+        ./dev.sh layout Release ${{ matrix.runtime }}
+      working-directory: src
+
+    - name: Package Release
+      run: |
+        ./dev.sh package Release ${{ matrix.runtime }}
+      working-directory: src
+
+    - name: Compute SHA256
+      run: |
+        for f in *.tar.gz; do
+          shasum -a 256 "$f" | tee "$f.sha256"
+        done
+      working-directory: _package
+
+    - name: Publish Artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: publish-package-${{ matrix.runtime }}
+        path: |
+          _package
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Read runner version
+      id: version
+      run: echo "version=$(cat src/runnerversion)" >> "$GITHUB_OUTPUT"
+
+    - name: Download packages
+      uses: actions/download-artifact@v8
+      with:
+        pattern: publish-package-*
+        merge-multiple: true
+        path: ./packages
+
+    - name: Create release notes
+      id: notes
+      run: |
+        {
+          echo 'body<<RELEASE_NOTES_EOF'
+          echo "Multi-repository runner fork build of runner v${{ steps.version.outputs.version }} (commit ${GITHUB_SHA})."
+          echo
+          echo 'Install (macOS Apple Silicon):'
+          echo '```bash'
+          echo 'mkdir actions-runner && cd actions-runner'
+          echo "curl -o actions-runner-osx-arm64-${{ steps.version.outputs.version }}.tar.gz -L ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/v${{ steps.version.outputs.version }}-multi.${GITHUB_RUN_NUMBER}/actions-runner-osx-arm64-${{ steps.version.outputs.version }}.tar.gz"
+          echo "tar xzf actions-runner-osx-arm64-${{ steps.version.outputs.version }}.tar.gz"
+          echo '```'
+          echo
+          echo 'SHA-256 checksums:'
+          echo '```'
+          cat packages/*.sha256
+          echo '```'
+          echo 'RELEASE_NOTES_EOF'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Create release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ steps.version.outputs.version }}-multi.${{ github.run_number }}
+        name: v${{ steps.version.outputs.version }}-multi.${{ github.run_number }}
+        body: ${{ steps.notes.outputs.body }}
+        make_latest: true
+        files: |
+          packages/*.tar.gz
+          packages/*.sha256
