@@ -737,5 +737,53 @@ namespace GitHub.Runner.Common.Tests.Listener
                 Assert.True(tc.AllowAuthMigration);
             }
         }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Runner")]
+        public async Task InjectedListenersUseIndependentServerConnections()
+        {
+            using (TestHostContext tc = CreateTestContext())
+            using (var tokenSource = new CancellationTokenSource())
+            {
+                // Arrange: two listeners with per-registration settings, stores,
+                // and key managers, each backed by its own server instances.
+                var settingsA = new RunnerSettings { AgentId = 1, AgentName = "runner-a", PoolId = 1, ServerUrl = "http://server-a", WorkFolder = "_work" };
+                var settingsB = new RunnerSettings { AgentId = 2, AgentName = "runner-b", PoolId = 2, ServerUrl = "http://server-b", WorkFolder = "_work" };
+                var serverA = new Mock<IRunnerServer>();
+                var serverB = new Mock<IRunnerServer>();
+                serverA.Setup(x => x.CreateAgentSessionAsync(It.IsAny<int>(), It.IsAny<TaskAgentSession>(), It.IsAny<CancellationToken>())).Returns(Task.FromResult(new TaskAgentSession()));
+                serverB.Setup(x => x.CreateAgentSessionAsync(It.IsAny<int>(), It.IsAny<TaskAgentSession>(), It.IsAny<CancellationToken>())).Returns(Task.FromResult(new TaskAgentSession()));
+                tc.EnqueueInstance<IRunnerServer>(serverA.Object);
+                tc.EnqueueInstance<IRunnerServer>(serverB.Object);
+                tc.EnqueueInstance<IBrokerServer>(new Mock<IBrokerServer>().Object);
+                tc.EnqueueInstance<IBrokerServer>(new Mock<IBrokerServer>().Object);
+
+                var storeA = new Mock<IConfigurationStore>();
+                var storeB = new Mock<IConfigurationStore>();
+                var keyA = new Mock<IRSAKeyManager>();
+                var keyB = new Mock<IRSAKeyManager>();
+                _credMgr.Setup(x => x.LoadCredentials(It.IsAny<bool>(), It.IsAny<IConfigurationStore>(), It.IsAny<IRSAKeyManager>())).Returns(new VssCredentials());
+
+                // Act.
+                var listenerA = new MessageListener(settingsA, storeA.Object, keyA.Object);
+                listenerA.Initialize(tc);
+                var listenerB = new MessageListener(settingsB, storeB.Object, keyB.Object);
+                listenerB.Initialize(tc);
+
+                Assert.Equal(CreateSessionResult.Success, await listenerA.CreateSessionAsync(tokenSource.Token));
+                Assert.Equal(CreateSessionResult.Success, await listenerB.CreateSessionAsync(tokenSource.Token));
+
+                // Assert: each listener connected its own server to its own URL
+                // and created a session in its own pool with its own credentials.
+                serverA.Verify(x => x.ConnectAsync(new Uri("http://server-a"), It.IsAny<VssCredentials>()), Times.Once);
+                serverB.Verify(x => x.ConnectAsync(new Uri("http://server-b"), It.IsAny<VssCredentials>()), Times.Once);
+                serverA.Verify(x => x.CreateAgentSessionAsync(1, It.IsAny<TaskAgentSession>(), It.IsAny<CancellationToken>()), Times.Once);
+                serverB.Verify(x => x.CreateAgentSessionAsync(2, It.IsAny<TaskAgentSession>(), It.IsAny<CancellationToken>()), Times.Once);
+                _credMgr.Verify(x => x.LoadCredentials(false, storeA.Object, keyA.Object), Times.Once);
+                _credMgr.Verify(x => x.LoadCredentials(false, storeB.Object, keyB.Object), Times.Once);
+                _config.Verify(x => x.LoadSettings(), Times.Never);
+            }
+        }
     }
 }

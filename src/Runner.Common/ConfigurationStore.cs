@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.Serialization;
@@ -163,6 +164,11 @@ namespace GitHub.Runner.Common
     [ServiceLocator(Default = typeof(ConfigurationStore))]
     public interface IConfigurationStore : IRunnerService
     {
+        // When set, the store reads/writes its per-registration files
+        // (.runner, .credentials, ...) from this directory instead of the
+        // runner root. Used for the multi-repository layout where each
+        // registration lives under <root>/.runners/<slug>/.
+        string ConfigDirectoryOverride { get; set; }
         bool IsConfigured();
         bool IsServiceConfigured();
         bool HasCredentials();
@@ -225,6 +231,41 @@ namespace GitHub.Runner.Common
 
         public string RootFolder { get; private set; }
 
+        private string _configDirectoryOverride;
+
+        public string ConfigDirectoryOverride
+        {
+            get => _configDirectoryOverride;
+            set
+            {
+                ArgUtil.NotNullOrEmpty(value, nameof(ConfigDirectoryOverride));
+                _configDirectoryOverride = value;
+                _configFilePath = Path.Combine(value, ".runner");
+                _migratedConfigFilePath = Path.Combine(value, ".runner_migrated");
+                _credFilePath = Path.Combine(value, ".credentials");
+                _migratedCredFilePath = Path.Combine(value, ".credentials_migrated");
+                _settings = null;
+                _migratedSettings = null;
+                _creds = null;
+                _migratedCreds = null;
+                Trace.Info("Configuration store scoped to registration directory: {0}", value);
+            }
+        }
+
+        // Registration directories of the multi-repository layout, ordered for determinism.
+        private IEnumerable<string> EnumerateRegistrationDirectories()
+        {
+            var registrationsRoot = Path.Combine(RootFolder, Constants.MultiConfig.RegistrationsDirectory);
+            if (!Directory.Exists(registrationsRoot))
+            {
+                return Enumerable.Empty<string>();
+            }
+
+            return Directory.EnumerateDirectories(registrationsRoot)
+                .Where(dir => File.Exists(Path.Combine(dir, ".runner")) || File.Exists(Path.Combine(dir, ".runner_migrated")))
+                .OrderBy(dir => dir, StringComparer.Ordinal);
+        }
+
         public bool HasCredentials()
         {
             Trace.Info("HasCredentials()");
@@ -237,6 +278,11 @@ namespace GitHub.Runner.Common
         {
             Trace.Info("IsConfigured()");
             bool configured = new FileInfo(_configFilePath).Exists || new FileInfo(_migratedConfigFilePath).Exists;
+            if (!configured && string.IsNullOrEmpty(_configDirectoryOverride))
+            {
+                // Multi-repository layout: registrations live under <root>/.runners/<slug>/.
+                configured = EnumerateRegistrationDirectories().Any();
+            }
             Trace.Info("IsConfigured: {0}", configured);
             return configured;
         }
@@ -282,9 +328,20 @@ namespace GitHub.Runner.Common
             if (_settings == null)
             {
                 RunnerSettings configuredSettings = null;
-                if (File.Exists(_configFilePath))
+                var settingsFilePath = _configFilePath;
+                if (!File.Exists(settingsFilePath) && string.IsNullOrEmpty(_configDirectoryOverride))
                 {
-                    string json = File.ReadAllText(_configFilePath, Encoding.UTF8);
+                    // Multi-repository layout: fall back to the first registration so
+                    // process-wide consumers (work folder resolution, user agent) keep
+                    // working when no flat .runner file exists.
+                    settingsFilePath = EnumerateRegistrationDirectories()
+                        .Select(dir => Path.Combine(dir, ".runner"))
+                        .FirstOrDefault(File.Exists) ?? settingsFilePath;
+                }
+
+                if (File.Exists(settingsFilePath))
+                {
+                    string json = File.ReadAllText(settingsFilePath, Encoding.UTF8);
                     Trace.Info($"Read setting file: {json.Length} chars");
                     configuredSettings = StringUtil.ConvertFromJson<RunnerSettings>(json);
                 }

@@ -16,6 +16,13 @@ namespace GitHub.Runner.Listener.Configuration
     public interface IRSAKeyManager : IRunnerService
     {
         /// <summary>
+        /// When set, the key manager reads/writes the key at this file path instead
+        /// of the default root-level .credentials_rsaparams. Used for the
+        /// multi-repository layout where each registration has its own key.
+        /// </summary>
+        string KeyFileOverride { get; set; }
+
+        /// <summary>
         /// Creates a new <c>RSACryptoServiceProvider</c> instance for the current runner. If a key file is found then the current
         /// key is returned to the caller.
         /// </summary>

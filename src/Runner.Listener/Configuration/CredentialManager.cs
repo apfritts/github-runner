@@ -14,6 +14,7 @@ namespace GitHub.Runner.Listener.Configuration
     {
         ICredentialProvider GetCredentialProvider(string credType);
         VssCredentials LoadCredentials(bool allowAuthUrlV2);
+        VssCredentials LoadCredentials(bool allowAuthUrlV2, IConfigurationStore store, IRSAKeyManager keyManager);
     }
 
     public class CredentialManager : RunnerService, ICredentialManager
@@ -42,7 +43,12 @@ namespace GitHub.Runner.Listener.Configuration
 
         public VssCredentials LoadCredentials(bool allowAuthUrlV2)
         {
-            IConfigurationStore store = HostContext.GetService<IConfigurationStore>();
+            return LoadCredentials(allowAuthUrlV2, HostContext.GetService<IConfigurationStore>(), keyManager: null);
+        }
+
+        public VssCredentials LoadCredentials(bool allowAuthUrlV2, IConfigurationStore store, IRSAKeyManager keyManager)
+        {
+            ArgUtil.NotNull(store, nameof(store));
 
             if (!store.HasCredentials())
             {
@@ -59,6 +65,7 @@ namespace GitHub.Runner.Listener.Configuration
 
             ICredentialProvider credProv = GetCredentialProvider(credData.Scheme);
             credProv.CredentialData = credData;
+            credProv.KeyManagerOverride = keyManager;
 
             VssCredentials creds = credProv.GetVssCredentials(HostContext, allowAuthUrlV2);
 

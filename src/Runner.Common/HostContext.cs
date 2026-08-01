@@ -449,31 +449,31 @@ namespace GitHub.Runner.Common
             {
                 case WellKnownConfigFile.Runner:
                     path = Path.Combine(
-                        GetDirectory(WellKnownDirectory.Root),
+                        GetRegistrationScopedRoot(),
                         ".runner");
                     break;
 
                 case WellKnownConfigFile.MigratedRunner:
                     path = Path.Combine(
-                        GetDirectory(WellKnownDirectory.Root),
+                        GetRegistrationScopedRoot(),
                         ".runner_migrated");
                     break;
 
                 case WellKnownConfigFile.Credentials:
                     path = Path.Combine(
-                        GetDirectory(WellKnownDirectory.Root),
+                        GetRegistrationScopedRoot(),
                         ".credentials");
                     break;
 
                 case WellKnownConfigFile.MigratedCredentials:
                     path = Path.Combine(
-                        GetDirectory(WellKnownDirectory.Root),
+                        GetRegistrationScopedRoot(),
                         ".credentials_migrated");
                     break;
 
                 case WellKnownConfigFile.RSACredentials:
                     path = Path.Combine(
-                        GetDirectory(WellKnownDirectory.Root),
+                        GetRegistrationScopedRoot(),
                         ".credentials_rsaparams");
                     break;
 
@@ -525,6 +525,32 @@ namespace GitHub.Runner.Common
 
             _trace.Info($"Well known config file '{configFile}': '{path}'");
             return path;
+        }
+
+        // Root for per-registration config files. When a registration is selected via
+        // the ACTIONS_RUNNER_ACTIVE_CONFIG environment variable (set by the listener
+        // on the worker process when multiple repositories are configured), these
+        // files live under <root>/.runners/<slug>/ instead of the runner root.
+        private string GetRegistrationScopedRoot()
+        {
+            var slug = Environment.GetEnvironmentVariable(Constants.MultiConfig.ActiveConfigEnvVar);
+            if (string.IsNullOrEmpty(slug))
+            {
+                return GetDirectory(WellKnownDirectory.Root);
+            }
+
+            // A slug must be a single path component: reject separators, rooted
+            // paths, and the exact traversal components. Interior dots are fine
+            // (RegistrationStore.MakeSlug preserves them, e.g. "owner-repo..backup").
+            if (slug.IndexOf('/') >= 0 || slug.IndexOf('\\') >= 0 || slug == "." || slug == ".." || Path.IsPathRooted(slug))
+            {
+                throw new InvalidOperationException($"Invalid value '{slug}' in environment variable '{Constants.MultiConfig.ActiveConfigEnvVar}'.");
+            }
+
+            return Path.Combine(
+                GetDirectory(WellKnownDirectory.Root),
+                Constants.MultiConfig.RegistrationsDirectory,
+                slug);
         }
 
         public Tracing GetTrace(string name)

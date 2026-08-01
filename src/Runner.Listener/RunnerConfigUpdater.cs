@@ -22,14 +22,44 @@ namespace GitHub.Runner.Listener
         private CredentialData _credData;
         private IRunnerServer _runnerServer;
         private IConfigurationStore _store;
+        private readonly RunnerSettings _injectedSettings;
+        private readonly IConfigurationStore _injectedStore;
+        private readonly IRunnerServer _injectedRunnerServer;
+
+        public RunnerConfigUpdater()
+        {
+        }
+
+        // Per-registration updater for the multi-repository layout, so refreshed
+        // configs land in the right .runners/<slug>/ directory.
+        public RunnerConfigUpdater(RunnerSettings settings, IConfigurationStore store, IRunnerServer runnerServer)
+        {
+            _injectedSettings = settings;
+            _injectedStore = store;
+            _injectedRunnerServer = runnerServer;
+        }
 
         public override void Initialize(IHostContext hostContext)
         {
             base.Initialize(hostContext);
-            _store = hostContext.GetService<IConfigurationStore>();
-            _settings = _store.GetSettings();
+            _store = _injectedStore ?? hostContext.GetService<IConfigurationStore>();
+            _settings = _injectedSettings ?? _store.GetSettings();
             _credData = _store.GetCredentials();
-            _runnerServer = HostContext.GetService<IRunnerServer>();
+            _runnerServer = _injectedRunnerServer ?? HostContext.GetService<IRunnerServer>();
+        }
+
+        private string GetRunnerConfigPath()
+        {
+            return string.IsNullOrEmpty(_store.ConfigDirectoryOverride)
+                ? HostContext.GetConfigFile(WellKnownConfigFile.Runner)
+                : Path.Combine(_store.ConfigDirectoryOverride, ".runner");
+        }
+
+        private string GetCredentialsConfigPath()
+        {
+            return string.IsNullOrEmpty(_store.ConfigDirectoryOverride)
+                ? HostContext.GetConfigFile(WellKnownConfigFile.Credentials)
+                : Path.Combine(_store.ConfigDirectoryOverride, ".credentials");
         }
 
         public async Task UpdateRunnerConfigAsync(string runnerQualifiedId, string configType, string serviceType, string configRefreshUrl)
@@ -78,7 +108,7 @@ namespace GitHub.Runner.Listener
         {
             Trace.Entering();
             // read the current runner settings and encode with base64
-            var runnerConfig = HostContext.GetConfigFile(WellKnownConfigFile.Runner);
+            var runnerConfig = GetRunnerConfigPath();
             string runnerConfigContent = File.ReadAllText(runnerConfig, Encoding.UTF8);
             var encodedConfig = Convert.ToBase64String(Encoding.UTF8.GetBytes(runnerConfigContent));
             if (string.IsNullOrEmpty(encodedConfig))
@@ -133,7 +163,7 @@ namespace GitHub.Runner.Listener
         {
             Trace.Entering();
             // read the current runner credentials and encode with base64
-            var credConfig = HostContext.GetConfigFile(WellKnownConfigFile.Credentials);
+            var credConfig = GetCredentialsConfigPath();
             string credConfigContent = File.ReadAllText(credConfig, Encoding.UTF8);
             var encodedConfig = Convert.ToBase64String(Encoding.UTF8.GetBytes(credConfigContent));
             if (string.IsNullOrEmpty(encodedConfig))

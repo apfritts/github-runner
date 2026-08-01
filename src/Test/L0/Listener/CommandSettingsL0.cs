@@ -747,7 +747,6 @@ namespace GitHub.Runner.Common.Tests
         [InlineData("remove", "monitorsocketaddress", "bar arg value")]
         [InlineData("remove", "name", "bar arg value")]
         [InlineData("remove", "runnergroup", "bar arg value")]
-        [InlineData("remove", "url", "bar arg value")]
         [InlineData("remove", "username", "bar arg value")]
         [InlineData("remove", "windowslogonaccount", "bar arg value")]
         [InlineData("remove", "windowslogonpassword", "bar arg value")]

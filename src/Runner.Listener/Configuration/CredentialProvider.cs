@@ -10,6 +10,10 @@ namespace GitHub.Runner.Listener.Configuration
     {
         Boolean RequireInteractive { get; }
         CredentialData CredentialData { get; set; }
+        // When set, OAuth token requests are signed with this key manager's key
+        // instead of the process-wide IRSAKeyManager singleton. Used for the
+        // multi-repository layout where each registration has its own key.
+        IRSAKeyManager KeyManagerOverride { get; set; }
         VssCredentials GetVssCredentials(IHostContext context, bool allowAuthUrlV2);
         void EnsureCredential(IHostContext context, CommandSettings command, string serverUrl);
     }
@@ -24,6 +28,7 @@ namespace GitHub.Runner.Listener.Configuration
 
         public virtual Boolean RequireInteractive => false;
         public CredentialData CredentialData { get; set; }
+        public IRSAKeyManager KeyManagerOverride { get; set; }
 
         public abstract VssCredentials GetVssCredentials(IHostContext context, bool allowAuthUrlV2);
         public abstract void EnsureCredential(IHostContext context, CommandSettings command, string serverUrl);

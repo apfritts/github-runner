@@ -167,15 +167,18 @@ namespace GitHub.Runner.Listener
                 // remove config files, remove service, and exit
                 if (command.Remove)
                 {
-                    // only remove local config files and exit
-                    if (command.RemoveLocalConfig)
-                    {
-                        configManager.DeleteLocalRunnerConfig();
-                        return Constants.Runner.ReturnCode.Success;
-                    }
                     try
                     {
-                        await configManager.UnconfigureAsync(command);
+                        if (command.RemoveLocalConfig)
+                        {
+                            // only remove local config files and exit; --url selects
+                            // the registration when several are configured
+                            configManager.DeleteLocalRunnerConfig(command);
+                        }
+                        else
+                        {
+                            await configManager.UnconfigureAsync(command);
+                        }
                         return Constants.Runner.ReturnCode.Success;
                     }
                     catch (Exception ex)
@@ -234,6 +237,12 @@ namespace GitHub.Runner.Listener
                 var base64JitConfig = command.GetJitConfig();
                 if (!string.IsNullOrEmpty(base64JitConfig))
                 {
+                    if (RegistrationStore.IsMultiLayoutAt(HostContext.GetDirectory(WellKnownDirectory.Root)))
+                    {
+                        _term.WriteError("--jitconfig is not supported when the runner is configured for multiple repositories.");
+                        return Constants.Runner.ReturnCode.TerminatedError;
+                    }
+
                     try
                     {
                         var decodedJitConfig = Encoding.UTF8.GetString(Convert.FromBase64String(base64JitConfig));
@@ -311,6 +320,12 @@ namespace GitHub.Runner.Listener
 
                     if (command.RunOnce)
                     {
+                        if (RegistrationStore.IsMultiLayoutAt(HostContext.GetDirectory(WellKnownDirectory.Root)))
+                        {
+                            _term.WriteError("--once is not supported when the runner is configured for multiple repositories.");
+                            return Constants.Runner.ReturnCode.TerminatedError;
+                        }
+
                         _term.WriteLine("Warning: '--once' is going to be deprecated in the future, please consider using '--ephemeral' during runner registration.", ConsoleColor.Yellow);
                         _term.WriteLine("https://docs.github.com/en/actions/hosting-your-own-runners/autoscaling-with-self-hosted-runners#using-ephemeral-runners-for-autoscaling", ConsoleColor.Yellow);
                     }
@@ -326,6 +341,16 @@ namespace GitHub.Runner.Listener
 
                     // hosted runner only run one job and would like to know the result of the job for telemetry and alerting on failure spike.
                     var returnJobResultForHosted = StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED"));
+
+                    // Multiple repository registrations are served by one process
+                    // via the coordinator; the classic single-registration loop is
+                    // untouched otherwise.
+                    if (RegistrationStore.IsMultiLayoutAt(HostContext.GetDirectory(WellKnownDirectory.Root)))
+                    {
+                        Trace.Info("Multi-repository layout detected; starting the multi-registration coordinator.");
+                        var coordinator = HostContext.GetService<IMultiRunnerCoordinator>();
+                        return await coordinator.RunAsync();
+                    }
 
                     // Run the runner interactively or as service
                     return await ExecuteRunnerAsync(settings, command.RunOnce || settings.Ephemeral || returnJobResultForHosted, returnJobResultForHosted);

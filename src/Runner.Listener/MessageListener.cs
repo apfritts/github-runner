@@ -59,14 +59,47 @@ namespace GitHub.Runner.Listener
         private VssCredentials _credsV2;
         private bool _needRefreshCredsV2 = false;
         private bool _handlerInitialized = false;
+        private readonly RunnerSettings _injectedSettings;
+        private readonly IConfigurationStore _injectedStore;
+        private readonly IRSAKeyManager _injectedKeyManager;
+        private readonly IRunnerServer _injectedRunnerServer;
+        private readonly IBrokerServer _injectedBrokerServer;
+
+        public MessageListener()
+        {
+        }
+
+        // Per-registration listener for the multi-repository layout: settings,
+        // config store, and RSA key are supplied instead of loaded from the
+        // process-wide singletons, so several listeners can coexist. Server
+        // instances may be shared with the registration's job dispatcher; when
+        // omitted, fresh instances are created.
+        public MessageListener(RunnerSettings settings, IConfigurationStore store, IRSAKeyManager keyManager, IRunnerServer runnerServer = null, IBrokerServer brokerServer = null)
+        {
+            _injectedSettings = settings;
+            _injectedStore = store;
+            _injectedKeyManager = keyManager;
+            _injectedRunnerServer = runnerServer;
+            _injectedBrokerServer = brokerServer;
+        }
 
         public override void Initialize(IHostContext hostContext)
         {
             base.Initialize(hostContext);
 
             _term = HostContext.GetService<ITerminal>();
-            _runnerServer = HostContext.GetService<IRunnerServer>();
-            _brokerServer = hostContext.GetService<IBrokerServer>();
+            if (_injectedSettings != null)
+            {
+                // Per-listener server connections so each can hold its own
+                // session against its own registration's URL and credentials.
+                _runnerServer = _injectedRunnerServer ?? HostContext.CreateService<IRunnerServer>();
+                _brokerServer = _injectedBrokerServer ?? hostContext.CreateService<IBrokerServer>();
+            }
+            else
+            {
+                _runnerServer = HostContext.GetService<IRunnerServer>();
+                _brokerServer = hostContext.GetService<IBrokerServer>();
+            }
             _credMgr = hostContext.GetService<ICredentialManager>();
         }
 
@@ -75,14 +108,21 @@ namespace GitHub.Runner.Listener
             Trace.Entering();
 
             // Settings
-            var configManager = HostContext.GetService<IConfigurationManager>();
-            _settings = configManager.LoadSettings();
+            if (_injectedSettings != null)
+            {
+                _settings = _injectedSettings;
+            }
+            else
+            {
+                var configManager = HostContext.GetService<IConfigurationManager>();
+                _settings = configManager.LoadSettings();
+            }
             var serverUrl = _settings.ServerUrl;
             Trace.Info(_settings);
 
             // Create connection.
             Trace.Info("Loading Credentials");
-            _creds = _credMgr.LoadCredentials(allowAuthUrlV2: false);
+            _creds = LoadCredentials(allowAuthUrlV2: false);
 
             var agent = new TaskAgentReference
             {
@@ -199,6 +239,10 @@ namespace GitHub.Runner.Listener
                 if (_handlerInitialized)
                 {
                     HostContext.AuthMigrationChanged -= HandleAuthMigrationChanged;
+                    // Allow a later CreateSessionAsync on this instance to
+                    // re-subscribe (the multi-repository coordinator deletes and
+                    // recreates sessions on the same listener).
+                    _handlerInitialized = false;
                 }
 
                 if (!_accessTokenRevoked)
@@ -265,7 +309,7 @@ namespace GitHub.Runner.Listener
                     {
                         var migrationMessage = JsonUtility.FromString<BrokerMigrationMessage>(message.Body);
 
-                        _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+                        _credsV2 = LoadCredentials(allowAuthUrlV2: true);
                         await _brokerServer.UpdateConnectionIfNeeded(migrationMessage.BrokerBaseUrl, _credsV2);
                         if (_needRefreshCredsV2)
                         {
@@ -434,8 +478,15 @@ namespace GitHub.Runner.Listener
         public async Task RefreshListenerTokenAsync()
         {
             await _runnerServer.RefreshConnectionAsync(RunnerConnectionType.MessageQueue, TimeSpan.FromSeconds(60));
-            _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+            _credsV2 = LoadCredentials(allowAuthUrlV2: true);
             await _brokerServer.ForceRefreshConnection(_credsV2);
+        }
+
+        private VssCredentials LoadCredentials(bool allowAuthUrlV2)
+        {
+            return _injectedSettings != null
+                ? _credMgr.LoadCredentials(allowAuthUrlV2, _injectedStore, _injectedKeyManager)
+                : _credMgr.LoadCredentials(allowAuthUrlV2);
         }
 
         public async Task AcknowledgeMessageAsync(string runnerRequestId, CancellationToken cancellationToken)
@@ -483,7 +534,7 @@ namespace GitHub.Runner.Listener
             if (_session.EncryptionKey.Encrypted)
             {
                 // The agent session encryption key uses the AES symmetric algorithm
-                var keyManager = HostContext.GetService<IRSAKeyManager>();
+                var keyManager = _injectedKeyManager ?? HostContext.GetService<IRSAKeyManager>();
                 using (var rsa = keyManager.GetKey())
                 {
                     var padding = _session.UseFipsEncryption ? RSAEncryptionPadding.OaepSHA256 : RSAEncryptionPadding.OaepSHA1;

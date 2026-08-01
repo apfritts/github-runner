@@ -258,6 +258,15 @@ namespace GitHub.Runner.Common
             public static readonly string OAuth = "OAuth";
         }
 
+        public static class MultiConfig
+        {
+            // Selects which registration under RegistrationsDirectory a process
+            // (e.g. Runner.Worker spawned for a job) resolves its per-registration
+            // config files (.runner, .credentials, ...) from.
+            public static readonly string ActiveConfigEnvVar = "ACTIONS_RUNNER_ACTIVE_CONFIG";
+            public static readonly string RegistrationsDirectory = ".runners";
+        }
+
         public static class Expressions
         {
             public static readonly string Always = "always";

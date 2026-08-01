@@ -11,7 +11,21 @@ namespace GitHub.Runner.Listener.Configuration
     public class RSAFileKeyManager : RunnerService, IRSAKeyManager
     {
         private string _keyFile;
+        private string _keyFileOverride;
         private IHostContext _context;
+
+        public string KeyFileOverride
+        {
+            get => _keyFileOverride;
+            set
+            {
+                _keyFileOverride = value;
+                if (!string.IsNullOrEmpty(value))
+                {
+                    _keyFile = value;
+                }
+            }
+        }
 
         public RSA CreateKey()
         {
