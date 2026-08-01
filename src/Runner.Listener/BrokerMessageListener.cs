@@ -62,13 +62,14 @@ namespace GitHub.Runner.Listener
         // since DELETE /session identifies the runner via the credential JWT).
         // Server instances may be shared with the registration's job
         // dispatcher; when omitted, fresh instances are created.
-        public BrokerMessageListener(RunnerSettings settings, IConfigurationStore store, IRSAKeyManager keyManager, IRunnerServer runnerServer = null, IBrokerServer brokerServer = null)
+        public BrokerMessageListener(RunnerSettings settings, IConfigurationStore store, IRSAKeyManager keyManager, IRunnerServer runnerServer = null, IBrokerServer brokerServer = null, bool isMigratedSettings = false)
         {
             _settings = settings;
             _injectedStore = store;
             _injectedKeyManager = keyManager;
             _injectedRunnerServer = runnerServer;
             _injectedBrokerServer = brokerServer;
+            _isMigratedSettings = isMigratedSettings;
         }
 
         public override void Initialize(IHostContext hostContext)
@@ -276,6 +277,10 @@ namespace GitHub.Runner.Listener
                 if (_handlerInitialized)
                 {
                     HostContext.AuthMigrationChanged -= HandleAuthMigrationChanged;
+                    // Allow a later CreateSessionAsync on this instance to
+                    // re-subscribe (the multi-repository coordinator deletes and
+                    // recreates sessions on the same listener).
+                    _handlerInitialized = false;
                 }
 
                 if (!_accessTokenRevoked)

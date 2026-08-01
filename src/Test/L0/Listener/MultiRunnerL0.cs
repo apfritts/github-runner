@@ -53,20 +53,23 @@ namespace GitHub.Runner.Common.Tests.Listener
             public int PollCalls;
         }
 
-        private void SeedRegistration(string slug, string gitHubUrl)
+        private void SeedRegistration(string slug, string gitHubUrl, bool alsoMigrated = false)
         {
             var dir = Path.Combine(_tempRoot, Constants.MultiConfig.RegistrationsDirectory, slug);
             Directory.CreateDirectory(dir);
-            IOUtil.SaveObject(
-                new RunnerSettings
-                {
-                    AgentId = (ulong)(slug.GetHashCode() & 0x7FFFFFFF),
-                    AgentName = "test-runner",
-                    GitHubUrl = gitHubUrl,
-                    ServerUrl = "http://localhost/tenant",
-                    WorkFolder = "_work",
-                },
-                Path.Combine(dir, ".runner"));
+            var settings = new RunnerSettings
+            {
+                AgentId = (ulong)(slug.GetHashCode() & 0x7FFFFFFF),
+                AgentName = "test-runner",
+                GitHubUrl = gitHubUrl,
+                ServerUrl = "http://localhost/tenant",
+                WorkFolder = "_work",
+            };
+            IOUtil.SaveObject(settings, Path.Combine(dir, ".runner"));
+            if (alsoMigrated)
+            {
+                IOUtil.SaveObject(settings, Path.Combine(dir, ".runner_migrated"));
+            }
         }
 
         private TestHostContext CreateTestContext(Dictionary<string, TestSlot> slots, [System.Runtime.CompilerServices.CallerMemberName] string testName = "")
@@ -78,24 +81,40 @@ namespace GitHub.Runner.Common.Tests.Listener
 
             foreach (var _ in slots)
             {
-                hc.EnqueueInstance<IConfigurationStore>(new ConfigurationStore());
-                var keyManager = new Mock<IRSAKeyManager>();
-                keyManager.SetupAllProperties();
-                hc.EnqueueInstance<IRSAKeyManager>(keyManager.Object);
-                hc.EnqueueInstance<IRunnerServer>(new Mock<IRunnerServer>().Object);
-                hc.EnqueueInstance<IBrokerServer>(new Mock<IBrokerServer>().Object);
+                // Multiple sets per slot: slot rebuilds (raced messages, migrated
+                // fallback) construct a fresh collaborator set each time.
+                for (int i = 0; i < 3; i++)
+                {
+                    hc.EnqueueInstance<IConfigurationStore>(new ConfigurationStore());
+                    var keyManager = new Mock<IRSAKeyManager>();
+                    keyManager.SetupAllProperties();
+                    hc.EnqueueInstance<IRSAKeyManager>(keyManager.Object);
+                    hc.EnqueueInstance<IRunnerServer>(new Mock<IRunnerServer>().Object);
+                    hc.EnqueueInstance<IBrokerServer>(new Mock<IBrokerServer>().Object);
+                }
             }
 
             return hc;
         }
 
-        private MultiRunnerCoordinator CreateCoordinator(TestHostContext hc, Dictionary<string, TestSlot> slots)
+        private MultiRunnerCoordinator CreateCoordinator(TestHostContext hc, Dictionary<string, TestSlot> slots, Dictionary<string, int> listenerFactoryCalls = null)
         {
             var coordinator = new MultiRunnerCoordinator
             {
                 // Route each registration to its scripted listener/dispatcher by
                 // the GitHub URL in its settings.
-                ListenerFactory = (settings, store, keyManager, runnerServer, brokerServer) => slots[settings.GitHubUrl].Listener.Object,
+                ListenerFactory = (settings, store, keyManager, runnerServer, brokerServer) =>
+                {
+                    if (listenerFactoryCalls != null)
+                    {
+                        lock (listenerFactoryCalls)
+                        {
+                            listenerFactoryCalls[settings.GitHubUrl] = listenerFactoryCalls.GetValueOrDefault(settings.GitHubUrl) + 1;
+                        }
+                    }
+
+                    return slots[settings.GitHubUrl].Listener.Object;
+                },
                 DispatcherFactory = (settings, runnerServer, store) => slots[settings.GitHubUrl].Dispatcher.Object,
             };
             coordinator.Initialize(hc);
@@ -286,7 +305,8 @@ namespace GitHub.Runner.Common.Tests.Listener
                     .Setup(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), false))
                     .Callback(() => jobDispatched = true);
 
-                var coordinator = CreateCoordinator(hc, slots);
+                var listenerFactoryCalls = new Dictionary<string, int>();
+                var coordinator = CreateCoordinator(hc, slots, listenerFactoryCalls);
                 var runTask = coordinator.RunAsync();
 
                 await WaitForAsync(() => jobDispatched, "job dispatched");
@@ -297,6 +317,59 @@ namespace GitHub.Runner.Common.Tests.Listener
                 slotB.Listener.Verify(x => x.DeleteMessageAsync(It.IsAny<TaskAgentMessage>()), Times.Never);
                 slotB.Listener.Verify(x => x.AcknowledgeMessageAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
                 slotB.Dispatcher.Verify(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), It.IsAny<bool>()), Times.Never);
+
+                // On resume, repo B's listener is rebuilt so its message cursor
+                // does not advertise the raced (unprocessed) message as consumed.
+                slotA.Dispatcher.Raise(x => x.JobStatus += null, new JobStatusEventArgs(TaskAgentStatus.Online));
+                await WaitForAsync(() => slotB.CreateSessionCalls >= 2, "repo B session recreated");
+                lock (listenerFactoryCalls)
+                {
+                    Assert.Equal(2, listenerFactoryCalls["https://github.com/apfritts/repo-b"]);
+                    Assert.Equal(1, listenerFactoryCalls["https://github.com/apfritts/repo-a"]);
+                }
+
+                hc.ShutdownRunner(ShutdownReason.UserCancelled);
+                Assert.Equal(Constants.Runner.ReturnCode.Success, await runTask);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Runner")]
+        public async Task MigratedSettingsFallBackToOriginalOnSessionConflict()
+        {
+            var slotA = new TestSlot();
+            var slots = new Dictionary<string, TestSlot>
+            {
+                ["https://github.com/apfritts/repo-a"] = slotA,
+            };
+            SeedRegistration("repo-a", "https://github.com/apfritts/repo-a", alsoMigrated: true);
+
+            using (var hc = CreateTestContext(slots))
+            {
+                // First attempt (migrated settings) conflicts; the rebuilt slot
+                // with original settings succeeds.
+                slotA.Listener
+                    .Setup(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()))
+                    .Returns(() =>
+                    {
+                        slotA.CreateSessionCalls++;
+                        return Task.FromResult(slotA.CreateSessionCalls == 1
+                            ? CreateSessionResult.SessionConflict
+                            : CreateSessionResult.Success);
+                    });
+                SetupBlockingPoll(slotA);
+
+                var listenerFactoryCalls = new Dictionary<string, int>();
+                var coordinator = CreateCoordinator(hc, slots, listenerFactoryCalls);
+                var runTask = coordinator.RunAsync();
+
+                await WaitForAsync(() => slotA.CreateSessionCalls >= 2, "fallback session attempt");
+                await WaitForAsync(() => slotA.PollCalls >= 1, "listening after fallback");
+                lock (listenerFactoryCalls)
+                {
+                    Assert.Equal(2, listenerFactoryCalls["https://github.com/apfritts/repo-a"]);
+                }
 
                 hc.ShutdownRunner(ShutdownReason.UserCancelled);
                 Assert.Equal(Constants.Runner.ReturnCode.Success, await runTask);

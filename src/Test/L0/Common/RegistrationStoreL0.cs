@@ -139,6 +139,32 @@ namespace GitHub.Runner.Common.Tests
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Common")]
+        public void PartialSlugDirectoryDoesNotHideLegacyConfig()
+        {
+            using (TestHostContext hc = new(this))
+            using (var root = new TempRoot())
+            {
+                var store = CreateStore(hc, root);
+                WriteSettings(root.Path, "https://github.com/apfritts/legacy-repo");
+
+                // A crashed migration leaves credentials but no .runner marker;
+                // such a directory must not shadow the intact legacy layout.
+                var partialDir = Path.Combine(root.Path, Constants.MultiConfig.RegistrationsDirectory, "broken");
+                Directory.CreateDirectory(partialDir);
+                File.WriteAllText(Path.Combine(partialDir, ".credentials"), "{\"scheme\":\"OAuth\"}");
+
+                var registrations = store.GetAll();
+
+                Assert.Equal(1, registrations.Count);
+                Assert.True(registrations[0].IsLegacy);
+                Assert.Equal("https://github.com/apfritts/legacy-repo", registrations[0].GitHubUrl);
+                Assert.False(store.IsMultiLayout());
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
         public void DeleteRegistrationRemovesDirectoryAndEmptyRegistrationsRoot()
         {
             using (TestHostContext hc = new(this))

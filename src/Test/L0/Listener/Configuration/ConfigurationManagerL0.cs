@@ -566,6 +566,7 @@ namespace GitHub.Runner.Common.Tests.Listener.Configuration
                        "--name", _expectedAgentName,
                        "--auth", _expectedAuthType,
                        "--token", _expectedToken,
+                       "--work", _expectedWorkFolder,
                        "--unattended",
                     });
 
@@ -683,6 +684,113 @@ namespace GitHub.Runner.Common.Tests.Listener.Configuration
                 Assert.True(System.IO.Directory.Exists(System.IO.Path.Combine(_tempRoot, Constants.MultiConfig.RegistrationsDirectory, "org-a")));
                 _dotcomServer.Verify(x => x.DeleteRunnerAsync("https://codedev.ms/org-b", _expectedToken, 22), Times.Once);
                 slugKeyManager.Verify(x => x.DeleteKey(), Times.Once);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "ConfigurationManagement")]
+        public void RemoveLocalWithUrlSelectorRemovesOnlyThatRegistration()
+        {
+            using (TestHostContext tc = CreateTestContext())
+            {
+                SeedRegistration("org-a", "https://codedev.ms/org-a", useRunnerAdminFlow: true, agentId: 11);
+                SeedRegistration("org-b", "https://codedev.ms/org-b", useRunnerAdminFlow: true, agentId: 22);
+                tc.EnqueueInstance<IConfigurationStore>(new ConfigurationStore());
+                var slugKeyManager = new Mock<IRSAKeyManager>();
+                tc.EnqueueInstance<IRSAKeyManager>(slugKeyManager.Object);
+
+                IConfigurationManager configManager = new ConfigurationManager();
+                configManager.Initialize(tc);
+
+                var command = new CommandSettings(
+                    tc,
+                    new[]
+                    {
+                       "remove",
+                       "--local",
+                       "--url", "https://codedev.ms/org-b",
+                       "--unattended",
+                    });
+
+                configManager.DeleteLocalRunnerConfig(command);
+
+                // Only org-b's files are removed, with no server-side calls.
+                Assert.False(System.IO.Directory.Exists(System.IO.Path.Combine(_tempRoot, Constants.MultiConfig.RegistrationsDirectory, "org-b")));
+                Assert.True(System.IO.Directory.Exists(System.IO.Path.Combine(_tempRoot, Constants.MultiConfig.RegistrationsDirectory, "org-a")));
+                slugKeyManager.Verify(x => x.DeleteKey(), Times.Once);
+                _dotcomServer.Verify(x => x.DeleteRunnerAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<ulong>()), Times.Never);
+                _runnerServer.Verify(x => x.DeleteAgentAsync(It.IsAny<ulong>()), Times.Never);
+                _store.Verify(x => x.DeleteCredential(), Times.Never);
+                _store.Verify(x => x.DeleteSettings(), Times.Never);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "ConfigurationManagement")]
+        public async Task ConfigureDuplicateOnLegacyLayoutDoesNotMigrate()
+        {
+            using (TestHostContext tc = CreateTestContext())
+            {
+                SeedRegistration(null, _expectedServerUrl, legacy: true);
+                tc.EnqueueInstance<IConfigurationStore>(new ConfigurationStore());
+
+                IConfigurationManager configManager = new ConfigurationManager();
+                configManager.Initialize(tc);
+
+                var command = new CommandSettings(
+                    tc,
+                    new[]
+                    {
+                       "configure",
+                       "--url", _expectedServerUrl,
+                       "--token", _expectedToken,
+                       "--work", _expectedWorkFolder,
+                       "--unattended",
+                    });
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => configManager.ConfigureAsync(command));
+
+                // The failed configure must leave the legacy layout untouched.
+                Assert.Contains("already listening", ex.Message);
+                Assert.True(System.IO.File.Exists(System.IO.Path.Combine(_tempRoot, ".runner")));
+                Assert.False(System.IO.Directory.Exists(System.IO.Path.Combine(_tempRoot, Constants.MultiConfig.RegistrationsDirectory)));
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "ConfigurationManagement")]
+        public async Task ConfigureWorkFolderMismatchFailsBeforeServerRegistration()
+        {
+            using (TestHostContext tc = CreateTestContext())
+            {
+                SeedRegistration("first", "https://codedev.ms/org-one");
+                tc.EnqueueInstance<IConfigurationStore>(new ConfigurationStore());
+
+                IConfigurationManager configManager = new ConfigurationManager();
+                configManager.Initialize(tc);
+
+                var command = new CommandSettings(
+                    tc,
+                    new[]
+                    {
+                       "configure",
+                       "--url", _expectedServerUrl,
+                       "--token", _expectedToken,
+                       "--work", "_other_work",
+                       "--unattended",
+                    });
+
+                var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => configManager.ConfigureAsync(command));
+
+                // The mismatch is detected before anything is registered
+                // server-side or written locally.
+                Assert.Contains("same work folder", ex.Message);
+                _runnerServer.Verify(x => x.AddAgentAsync(It.IsAny<int>(), It.IsAny<TaskAgent>()), Times.Never);
+                _dotcomServer.Verify(x => x.AddRunnerAsync(It.IsAny<int>(), It.IsAny<TaskAgent>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+                Assert.False(System.IO.Directory.Exists(System.IO.Path.Combine(_tempRoot, Constants.MultiConfig.RegistrationsDirectory, "codedev.ms")));
             }
         }
 

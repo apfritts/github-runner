@@ -539,7 +539,10 @@ namespace GitHub.Runner.Common
                 return GetDirectory(WellKnownDirectory.Root);
             }
 
-            if (slug.IndexOf('/') >= 0 || slug.IndexOf('\\') >= 0 || slug.Contains(".."))
+            // A slug must be a single path component: reject separators, rooted
+            // paths, and the exact traversal components. Interior dots are fine
+            // (RegistrationStore.MakeSlug preserves them, e.g. "owner-repo..backup").
+            if (slug.IndexOf('/') >= 0 || slug.IndexOf('\\') >= 0 || slug == "." || slug == ".." || Path.IsPathRooted(slug))
             {
                 throw new InvalidOperationException($"Invalid value '{slug}' in environment variable '{Constants.MultiConfig.ActiveConfigEnvVar}'.");
             }

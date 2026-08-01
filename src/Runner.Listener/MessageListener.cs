@@ -239,6 +239,10 @@ namespace GitHub.Runner.Listener
                 if (_handlerInitialized)
                 {
                     HostContext.AuthMigrationChanged -= HandleAuthMigrationChanged;
+                    // Allow a later CreateSessionAsync on this instance to
+                    // re-subscribe (the multi-repository coordinator deletes and
+                    // recreates sessions on the same listener).
+                    _handlerInitialized = false;
                 }
 
                 if (!_accessTokenRevoked)

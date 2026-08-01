@@ -25,6 +25,7 @@ namespace GitHub.Runner.Listener.Configuration
         Task ConfigureAsync(CommandSettings command);
         Task UnconfigureAsync(CommandSettings command);
         void DeleteLocalRunnerConfig();
+        void DeleteLocalRunnerConfig(CommandSettings command);
         RunnerSettings LoadSettings();
         RunnerSettings LoadMigratedSettings();
     }
@@ -128,7 +129,8 @@ namespace GitHub.Runner.Listener.Configuration
             // under .runners/<slug>/ instead of failing (multi-repository mode).
             var existingRegistrations = _registrationStore.GetAll();
             bool addingRegistration = existingRegistrations.Count > 0;
-            string existingWorkFolder = null;
+            string multiModeWorkFolder = null;
+            bool migrateLegacyLayout = false;
             if (addingRegistration)
             {
 #if OS_WINDOWS
@@ -140,10 +142,12 @@ namespace GitHub.Runner.Listener.Configuration
                 }
 
                 var firstSettings = LoadRegistrationSettings(existingRegistrations[0]);
-                existingWorkFolder = firstSettings?.WorkFolder;
 
                 // GetAll() surfaces the flat single-repository layout as one legacy
                 // registration only when no .runners/<slug>/ registrations exist.
+                // Migration itself is deferred until the new registration has been
+                // validated and authenticated, so a failed configure leaves the
+                // existing layout untouched.
                 if (existingRegistrations[0].IsLegacy)
                 {
                     if (firstSettings.Ephemeral)
@@ -151,11 +155,18 @@ namespace GitHub.Runner.Listener.Configuration
                         throw new InvalidOperationException("The existing runner configuration is ephemeral and cannot be extended to multiple repositories. Run './config.sh remove' first.");
                     }
 
-                    // Move the flat single-repository layout into .runners/<slug>/
-                    // so both registrations use the same layout.
-                    var migrated = _registrationStore.MigrateLegacyToSlug();
-                    _term.WriteLine($"Migrated existing runner for {migrated.GitHubUrl} into the multi-repository layout.", ConsoleColor.Yellow);
-                    DisableUpdatesForRegistration(migrated);
+                    migrateLegacyLayout = true;
+                }
+
+                // One process serves every registration, so they must share a work
+                // folder; validate before anything is registered server-side.
+                // GetWork() consumes the arg (and prompts interactively), so the
+                // value is captured here and reused for the saved settings.
+                multiModeWorkFolder = command.GetWork();
+                if (!string.IsNullOrEmpty(firstSettings?.WorkFolder) &&
+                    !string.Equals(firstSettings.WorkFolder, multiModeWorkFolder, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException($"All repositories configured in this runner directory must use the same work folder. Existing registrations use '{firstSettings.WorkFolder}', but '{multiModeWorkFolder}' was specified.");
                 }
 
                 _term.WriteLine("This runner directory is already configured; adding another repository registration.", ConsoleColor.Cyan);
@@ -255,6 +266,16 @@ namespace GitHub.Runner.Listener.Configuration
             RegistrationRef newRegistration = null;
             if (addingRegistration)
             {
+                if (migrateLegacyLayout)
+                {
+                    // The new URL has been validated (duplicate-checked and
+                    // authenticated), so it is now safe to move the flat layout
+                    // into .runners/<slug>/.
+                    var migrated = _registrationStore.MigrateLegacyToSlug();
+                    _term.WriteLine($"Migrated existing runner for {migrated.GitHubUrl} into the multi-repository layout.", ConsoleColor.Yellow);
+                    DisableUpdatesForRegistration(migrated);
+                }
+
                 newRegistration = _registrationStore.CreateSlugDirectory(registrationUrl);
                 var slugStore = HostContext.CreateService<IConfigurationStore>();
                 slugStore.ConfigDirectoryOverride = newRegistration.Directory;
@@ -531,15 +552,8 @@ namespace GitHub.Runner.Listener.Configuration
             _term.WriteSection("Runner settings");
 
             // We will Combine() what's stored with root.  Defaults to string a relative path
-            runnerSettings.WorkFolder = command.GetWork();
-
-            // One process serves every registration, so they must share a work folder.
-            if (addingRegistration &&
-                !string.IsNullOrEmpty(existingWorkFolder) &&
-                !string.Equals(existingWorkFolder, runnerSettings.WorkFolder, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException($"All repositories configured in this runner directory must use the same work folder. Existing registrations use '{existingWorkFolder}', but '{runnerSettings.WorkFolder}' was specified.");
-            }
+            // (in multi-repository mode the value was captured and validated up front).
+            runnerSettings.WorkFolder = multiModeWorkFolder ?? command.GetWork();
 
             runnerSettings.MonitorSocketAddress = command.GetMonitorSocketAddress();
 
@@ -635,42 +649,7 @@ namespace GitHub.Runner.Listener.Configuration
 
                 // Resolve which registration to remove. With multiple registrations
                 // configured, --url selects the one to delete.
-                var registrations = _registrationStore.GetAll();
-                var urlArg = command.GetUrl(suppressPromptIfEmpty: true);
-                RegistrationRef target;
-                if (registrations.Count > 1)
-                {
-                    if (string.IsNullOrEmpty(urlArg))
-                    {
-                        throw new InvalidOperationException("This runner is configured for multiple repositories. Specify which one to remove with --url. Configured repositories:" + FormatRegistrationList(registrations));
-                    }
-
-                    target = _registrationStore.Find(urlArg);
-                    if (target == null)
-                    {
-                        throw new InvalidOperationException($"No registration found for {urlArg}. Configured repositories:" + FormatRegistrationList(registrations));
-                    }
-                }
-                else
-                {
-                    target = registrations.FirstOrDefault();
-                    if (!string.IsNullOrEmpty(urlArg) && target != null && _registrationStore.Find(urlArg) == null)
-                    {
-                        throw new InvalidOperationException($"No registration found for {urlArg}. This runner is configured for {target.GitHubUrl}.");
-                    }
-                }
-
-                IConfigurationStore store = _store;
-                IRSAKeyManager keyManager = HostContext.GetService<IRSAKeyManager>();
-                if (target != null && !target.IsLegacy)
-                {
-                    var slugStore = HostContext.CreateService<IConfigurationStore>();
-                    slugStore.ConfigDirectoryOverride = target.Directory;
-                    store = slugStore;
-                    var slugKeyManager = HostContext.CreateService<IRSAKeyManager>();
-                    slugKeyManager.KeyFileOverride = Path.Combine(target.Directory, ".credentials_rsaparams");
-                    keyManager = slugKeyManager;
-                }
+                var (target, store, keyManager) = ResolveRemovalTarget(command);
 
                 //delete agent from the server
                 currentAction = "Removing runner from the server";
@@ -745,6 +724,65 @@ namespace GitHub.Runner.Listener.Configuration
             }
 
             _term.WriteLine();
+        }
+
+        // Local-only removal (remove --local): resolves the target registration
+        // exactly like UnconfigureAsync, but skips the server-side deregistration.
+        public void DeleteLocalRunnerConfig(CommandSettings command)
+        {
+            var (target, store, keyManager) = ResolveRemovalTarget(command);
+            if (target != null && !target.IsLegacy)
+            {
+                DeleteLocalRegistration(target, store, keyManager);
+            }
+            else
+            {
+                DeleteLocalRunnerConfig();
+            }
+        }
+
+        // Selects which registration a removal targets (--url when several are
+        // configured) and builds its store/key manager.
+        private (RegistrationRef Target, IConfigurationStore Store, IRSAKeyManager KeyManager) ResolveRemovalTarget(CommandSettings command)
+        {
+            var registrations = _registrationStore.GetAll();
+            var urlArg = command.GetUrl(suppressPromptIfEmpty: true);
+            RegistrationRef target;
+            if (registrations.Count > 1)
+            {
+                if (string.IsNullOrEmpty(urlArg))
+                {
+                    throw new InvalidOperationException("This runner is configured for multiple repositories. Specify which one to remove with --url. Configured repositories:" + FormatRegistrationList(registrations));
+                }
+
+                target = _registrationStore.Find(urlArg);
+                if (target == null)
+                {
+                    throw new InvalidOperationException($"No registration found for {urlArg}. Configured repositories:" + FormatRegistrationList(registrations));
+                }
+            }
+            else
+            {
+                target = registrations.FirstOrDefault();
+                if (!string.IsNullOrEmpty(urlArg) && target != null && _registrationStore.Find(urlArg) == null)
+                {
+                    throw new InvalidOperationException($"No registration found for {urlArg}. This runner is configured for {target.GitHubUrl}.");
+                }
+            }
+
+            IConfigurationStore store = _store;
+            IRSAKeyManager keyManager = HostContext.GetService<IRSAKeyManager>();
+            if (target != null && !target.IsLegacy)
+            {
+                var slugStore = HostContext.CreateService<IConfigurationStore>();
+                slugStore.ConfigDirectoryOverride = target.Directory;
+                store = slugStore;
+                var slugKeyManager = HostContext.CreateService<IRSAKeyManager>();
+                slugKeyManager.KeyFileOverride = Path.Combine(target.Directory, ".credentials_rsaparams");
+                keyManager = slugKeyManager;
+            }
+
+            return (target, store, keyManager);
         }
 
         // Removes one registration's local files and its .runners/<slug>/ directory,

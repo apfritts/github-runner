@@ -35,13 +35,17 @@ namespace GitHub.Runner.Common
     {
         // Per-registration files that move between the legacy flat layout and
         // a .runners/<slug>/ directory. The RSA key file must stay owner-only.
+        // Migration copies in this order: the .runner/.runner_migrated files are
+        // also the discovery markers (IsOccupied), so they are written last —
+        // a crash mid-migration leaves an unoccupied directory and the intact
+        // legacy layout stays authoritative.
         private static readonly string[] RegistrationFileNames =
         {
-            ".runner",
-            ".runner_migrated",
             ".credentials",
             ".credentials_migrated",
             ".credentials_rsaparams",
+            ".runner_migrated",
+            ".runner",
         };
 
         public string RootDirectory { get; set; }

@@ -29,6 +29,7 @@ namespace GitHub.Runner.Listener
     {
         private enum SlotState
         {
+            Creating,       // session creation attempt in flight
             Listening,      // session active, long-poll armed
             Paused,         // session deleted while another slot runs a job
             Degraded,       // session creation failed; retried on a timer
@@ -48,14 +49,30 @@ namespace GitHub.Runner.Listener
             public IJobDispatcher Dispatcher;
             public SlotState State;
             public bool UsingMigratedSettings;
+            public bool NeedsRebuild;
             public CancellationTokenSource PollCts;
             public Task<TaskAgentMessage> PollTask;
+            public Task SessionTask;
             public DateTime NextSessionRetryUtc;
 
             public string DisplayName => Settings?.GitHubUrl ?? Registration.Slug;
         }
 
+        private enum SessionAttemptOutcome
+        {
+            Success,
+            Conflict,
+            Failure,
+            TimedOut,
+            Error,
+            Shutdown,
+        }
+
         private static readonly TimeSpan SessionRetryDelay = TimeSpan.FromMinutes(5);
+        // The listeners retry transient session-creation failures internally
+        // (conflicts for ~4 minutes, connection errors indefinitely); bound each
+        // attempt so one bad registration cannot stall the others.
+        private static readonly TimeSpan SessionAttemptTimeout = TimeSpan.FromSeconds(90);
         private static readonly TimeSpan VersionCheckInterval = TimeSpan.FromHours(24);
 
         private readonly List<Slot> _slots = new();
@@ -63,6 +80,7 @@ namespace GitHub.Runner.Listener
         private IErrorThrottler _acquireJobThrottler;
         private Slot _busySlot;
         private TaskCompletionSource<object> _jobIdleSignal;
+        private TaskCompletionSource<object> _wakeSignal;
         private DateTime _nextVersionCheckUtc = DateTime.MinValue;
 
         // Test hooks: override construction of per-registration collaborators.
@@ -148,14 +166,16 @@ namespace GitHub.Runner.Listener
 
                 if (_busySlot == null)
                 {
+                    // Session (re)creation runs in the background so a slow or
+                    // conflicted registration never blocks the others' polling.
                     foreach (var slot in _slots.Where(x => x.State == SlotState.RestartPending).ToList())
                     {
-                        await RestartSlotAsync(slot, shutdownToken);
+                        BeginRestartSlot(slot, shutdownToken);
                     }
 
                     foreach (var slot in _slots.Where(x => x.State == SlotState.Degraded && DateTime.UtcNow >= x.NextSessionRetryUtc).ToList())
                     {
-                        await CreateSessionForSlotAsync(slot, shutdownToken);
+                        BeginCreateSession(slot, shutdownToken);
                     }
 
                     // With automatic updates disabled, warn periodically when a
@@ -173,8 +193,14 @@ namespace GitHub.Runner.Listener
                     StartPoll(slot);
                 }
 
+                if (_wakeSignal == null || _wakeSignal.Task.IsCompleted)
+                {
+                    _wakeSignal = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+                }
+
                 var waits = new List<Task>();
                 waits.AddRange(_slots.Where(x => x.PollTask != null).Select(x => (Task)x.PollTask));
+                waits.Add(_wakeSignal.Task);
 
                 if (_busySlot != null && _jobIdleSignal != null)
                 {
@@ -199,26 +225,20 @@ namespace GitHub.Runner.Listener
                     waits.Add(retryDelay);
                 }
 
-                if (waits.Count == 0)
-                {
-                    _term.WriteError("No repository registrations are listening and none can recover. Shutting down.");
-                    return Constants.Runner.ReturnCode.TerminatedError;
-                }
-
                 var completedTask = await Task.WhenAny(waits);
                 if (shutdownToken.IsCancellationRequested)
                 {
                     return Constants.Runner.ReturnCode.Success;
                 }
 
-                if (completedTask == retryDelay)
+                if (completedTask == retryDelay || completedTask == _wakeSignal.Task)
                 {
                     continue;
                 }
 
                 if (_jobIdleSignal != null && completedTask == _jobIdleSignal.Task)
                 {
-                    await ResumeSlotsAsync(shutdownToken);
+                    ResumeSlots(shutdownToken);
                     continue;
                 }
 
@@ -261,16 +281,19 @@ namespace GitHub.Runner.Listener
                     // The service refuses runners below its minimum version.
                     Trace.Error(ex);
                     _term.WriteError($"GitHub rejected runner version {BuildConstants.RunnerPackage.Version} for {winner.DisplayName} as too old. Automatic updates are disabled in multi-repository mode - rebase and rebuild this fork to continue.");
+                    await TeardownSessionQuietlyAsync(winner);
                     winner.State = SlotState.Dead;
                     continue;
                 }
                 catch (Exception ex)
                 {
                     // The listener retries transient errors internally, so an
-                    // exception here is close to fatal for the slot; back off and
-                    // rebuild the session later.
+                    // exception here is close to fatal for the slot; drop the
+                    // (possibly still active) session so the runner shows Offline
+                    // and the retry doesn't conflict with it, then back off.
                     Trace.Error($"[{winner.DisplayName}] Message poll failed.");
                     Trace.Error(ex);
+                    await TeardownSessionQuietlyAsync(winner);
                     MarkDegraded(winner);
                     continue;
                 }
@@ -451,7 +474,7 @@ namespace GitHub.Runner.Listener
             {
                 // The job evaporated (finished, cancelled, or taken elsewhere);
                 // bring everyone back online.
-                await ResumeSlotsAsync(shutdownToken);
+                ResumeSlots(shutdownToken);
                 return;
             }
 
@@ -486,7 +509,11 @@ namespace GitHub.Runner.Listener
                         {
                             // Neither acknowledged nor deleted: the server holds
                             // the job and redelivers it once a session is back.
-                            Trace.Info($"[{slot.DisplayName}] Leaving raced message {racedMessage.MessageId} ({racedMessage.MessageType}) untouched; the server will redeliver it.");
+                            // The listener recorded this message id as its cursor,
+                            // though, so rebuild the listener on resume — a stale
+                            // cursor could otherwise skip the redelivery.
+                            Trace.Info($"[{slot.DisplayName}] Leaving raced message {racedMessage.MessageId} ({racedMessage.MessageType}) untouched; the listener will be rebuilt so the server redelivers it.");
+                            slot.NeedsRebuild = true;
                         }
                     }
                     catch (OperationCanceledException)
@@ -521,73 +548,162 @@ namespace GitHub.Runner.Listener
             _term.WriteLine($"{DateTime.UtcNow:u}: Paused listening for {string.Join(", ", toSuspend.Select(x => x.DisplayName))} while a job runs");
         }
 
-        private async Task ResumeSlotsAsync(CancellationToken shutdownToken)
+        // Brings suspended registrations back online. Session creation runs in the
+        // background per slot; each prints "[...] Listening for Jobs" as it lands.
+        private void ResumeSlots(CancellationToken shutdownToken)
         {
             _busySlot = null;
             _jobIdleSignal = null;
 
             foreach (var slot in _slots.Where(x => x.State == SlotState.RestartPending).ToList())
             {
-                await RestartSlotAsync(slot, shutdownToken);
+                BeginRestartSlot(slot, shutdownToken);
             }
 
-            var toResume = _slots.Where(x => x.State == SlotState.Paused).ToList();
-            if (toResume.Count > 0)
+            foreach (var slot in _slots.Where(x => x.State == SlotState.Paused).ToList())
             {
-                await Task.WhenAll(toResume.Select(x => CreateSessionForSlotAsync(x, shutdownToken)));
-                var resumed = toResume.Where(x => x.State == SlotState.Listening).Select(x => x.DisplayName).ToList();
-                if (resumed.Count > 0)
+                if (slot.NeedsRebuild)
                 {
-                    _term.WriteLine($"{DateTime.UtcNow:u}: Resumed listening for {string.Join(", ", resumed)}");
+                    RebuildSlot(slot, preferMigratedSettings: true);
                 }
+
+                BeginCreateSession(slot, shutdownToken);
             }
         }
 
         private async Task<CreateSessionResult> CreateSessionForSlotAsync(Slot slot, CancellationToken shutdownToken)
         {
+            slot.State = SlotState.Creating;
+            var outcome = await TryCreateSessionOnceAsync(slot, shutdownToken);
+
+            // Mirror the single-config runner: on ANY non-success result with
+            // migrated settings (failure, conflict, timeout), fall back to the
+            // original .runner settings and try once more.
+            if (outcome != SessionAttemptOutcome.Success &&
+                outcome != SessionAttemptOutcome.Shutdown &&
+                slot.UsingMigratedSettings)
+            {
+                Trace.Warning($"[{slot.DisplayName}] Session creation with migrated settings did not succeed ({outcome}); falling back to original settings.");
+                RebuildSlot(slot, preferMigratedSettings: false);
+                slot.State = SlotState.Creating;
+                outcome = await TryCreateSessionOnceAsync(slot, shutdownToken);
+            }
+
+            switch (outcome)
+            {
+                case SessionAttemptOutcome.Success:
+                    if (_busySlot != null && !ReferenceEquals(slot, _busySlot))
+                    {
+                        // A job started while this session was being created; go
+                        // straight back offline until it finishes.
+                        Trace.Info($"[{slot.DisplayName}] Session created while a job is running; pausing again.");
+                        await TeardownSessionQuietlyAsync(slot);
+                        slot.State = SlotState.Paused;
+                        return CreateSessionResult.Success;
+                    }
+
+                    slot.State = SlotState.Listening;
+                    _term.WriteLine($"{DateTime.UtcNow:u}: [{slot.DisplayName}] Listening for Jobs");
+                    return CreateSessionResult.Success;
+
+                case SessionAttemptOutcome.Conflict:
+                    // Another process holds this registration's session; keep
+                    // the other registrations alive and retry later.
+                    _term.WriteError($"A session for {slot.DisplayName} already exists elsewhere. Retrying in {SessionRetryDelay.TotalMinutes:0} minutes.");
+                    MarkDegraded(slot);
+                    return CreateSessionResult.SessionConflict;
+
+                case SessionAttemptOutcome.Shutdown:
+                    slot.State = SlotState.Paused;
+                    return CreateSessionResult.Failure;
+
+                case SessionAttemptOutcome.Failure:
+                    _term.WriteError($"Failed to create a session for {slot.DisplayName}. This registration stops listening.");
+                    slot.State = SlotState.Dead;
+                    return CreateSessionResult.Failure;
+
+                default:
+                    // TimedOut / Error: worth retrying on the degraded timer.
+                    MarkDegraded(slot);
+                    return CreateSessionResult.Failure;
+            }
+        }
+
+        // One bounded session-creation attempt. Never throws.
+        private async Task<SessionAttemptOutcome> TryCreateSessionOnceAsync(Slot slot, CancellationToken shutdownToken)
+        {
             try
             {
-                var result = await slot.Listener.CreateSessionAsync(shutdownToken);
-                switch (result)
+                using (var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(shutdownToken))
                 {
-                    case CreateSessionResult.Success:
-                        slot.State = SlotState.Listening;
-                        _term.WriteLine($"{DateTime.UtcNow:u}: [{slot.DisplayName}] Listening for Jobs");
-                        return result;
-
-                    case CreateSessionResult.SessionConflict:
-                        // Another process holds this registration's session; keep
-                        // the other registrations alive and retry later.
-                        _term.WriteError($"A session for {slot.DisplayName} already exists elsewhere. Retrying in {SessionRetryDelay.TotalMinutes:0} minutes.");
-                        MarkDegraded(slot);
-                        return result;
-
-                    default:
-                        if (slot.UsingMigratedSettings)
-                        {
-                            // Mirror the single-config fallback from migrated to
-                            // original settings.
-                            Trace.Warning($"[{slot.DisplayName}] Session creation failed with migrated settings; falling back to original settings.");
-                            RebuildSlot(slot, preferMigratedSettings: false);
-                            return await CreateSessionForSlotAsync(slot, shutdownToken);
-                        }
-
-                        _term.WriteError($"Failed to create a session for {slot.DisplayName}. This registration stops listening.");
-                        slot.State = SlotState.Dead;
-                        return result;
+                    attemptCts.CancelAfter(SessionAttemptTimeout);
+                    var result = await slot.Listener.CreateSessionAsync(attemptCts.Token);
+                    switch (result)
+                    {
+                        case CreateSessionResult.Success:
+                            return SessionAttemptOutcome.Success;
+                        case CreateSessionResult.SessionConflict:
+                            return SessionAttemptOutcome.Conflict;
+                        default:
+                            return SessionAttemptOutcome.Failure;
+                    }
                 }
             }
             catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested)
             {
-                slot.State = SlotState.Paused;
-                return CreateSessionResult.Failure;
+                return SessionAttemptOutcome.Shutdown;
+            }
+            catch (OperationCanceledException)
+            {
+                Trace.Warning($"[{slot.DisplayName}] Session creation attempt timed out after {SessionAttemptTimeout.TotalSeconds:0}s.");
+                return SessionAttemptOutcome.TimedOut;
             }
             catch (Exception ex)
             {
                 Trace.Error($"[{slot.DisplayName}] Session creation threw.");
                 Trace.Error(ex);
-                MarkDegraded(slot);
-                return CreateSessionResult.Failure;
+                return SessionAttemptOutcome.Error;
+            }
+        }
+
+        // Launches a session-creation attempt in the background; completion pulses
+        // the run loop awake so it can arm the new poll.
+        private void BeginCreateSession(Slot slot, CancellationToken shutdownToken)
+        {
+            if (slot.State == SlotState.Creating && slot.SessionTask?.IsCompleted == false)
+            {
+                return;
+            }
+
+            slot.State = SlotState.Creating;
+            slot.SessionTask = Task.Run(async () =>
+            {
+                try
+                {
+                    await CreateSessionForSlotAsync(slot, shutdownToken);
+                }
+                finally
+                {
+                    PulseWake();
+                }
+            });
+        }
+
+        private void PulseWake()
+        {
+            _wakeSignal?.TrySetResult(null);
+        }
+
+        private async Task TeardownSessionQuietlyAsync(Slot slot)
+        {
+            try
+            {
+                await slot.Listener.DeleteSessionAsync();
+            }
+            catch (Exception ex)
+            {
+                Trace.Error($"[{slot.DisplayName}] Failed to delete session.");
+                Trace.Error(ex);
             }
         }
 
@@ -604,35 +720,55 @@ namespace GitHub.Runner.Listener
             slot.PollTask = slot.Listener.GetNextMessageAsync(slot.PollCts.Token);
         }
 
-        private async Task RestartSlotAsync(Slot slot, CancellationToken shutdownToken)
+        // Rebuilds a slot after a config refresh: drain its poll, drop its session,
+        // reload settings, and create a fresh session — all in the background so
+        // the other registrations keep polling meanwhile.
+        private void BeginRestartSlot(Slot slot, CancellationToken shutdownToken)
         {
+            if (slot.State == SlotState.Creating && slot.SessionTask?.IsCompleted == false)
+            {
+                return;
+            }
+
             Trace.Info($"[{slot.DisplayName}] Restarting listener after config refresh.");
             slot.PollCts?.Cancel();
-            if (slot.PollTask != null)
+            var pollTask = slot.PollTask;
+            slot.PollTask = null;
+            var listener = slot.Listener;
+            slot.State = SlotState.Creating;
+            slot.SessionTask = Task.Run(async () =>
             {
                 try
                 {
-                    await slot.PollTask;
+                    if (pollTask != null)
+                    {
+                        try
+                        {
+                            await pollTask;
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }
+
+                    try
+                    {
+                        await listener.DeleteSessionAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Error($"[{slot.DisplayName}] Failed to delete session before restart.");
+                        Trace.Error(ex);
+                    }
+
+                    RebuildSlot(slot, preferMigratedSettings: true);
+                    await CreateSessionForSlotAsync(slot, shutdownToken);
                 }
-                catch (Exception)
+                finally
                 {
+                    PulseWake();
                 }
-
-                slot.PollTask = null;
-            }
-
-            try
-            {
-                await slot.Listener.DeleteSessionAsync();
-            }
-            catch (Exception ex)
-            {
-                Trace.Error($"[{slot.DisplayName}] Failed to delete session before restart.");
-                Trace.Error(ex);
-            }
-
-            RebuildSlot(slot, preferMigratedSettings: true);
-            await CreateSessionForSlotAsync(slot, shutdownToken);
+            });
         }
 
         private async Task HandleRegistrationGoneAsync(Slot slot, Exception ex)
@@ -663,6 +799,24 @@ namespace GitHub.Runner.Listener
             foreach (var slot in _slots)
             {
                 slot.PollCts?.Cancel();
+            }
+
+            // Let in-flight background session creations finish (they observe the
+            // shutdown token) before deleting sessions underneath them.
+            foreach (var slot in _slots)
+            {
+                if (slot.SessionTask != null)
+                {
+                    try
+                    {
+                        await slot.SessionTask;
+                    }
+                    catch (Exception)
+                    {
+                    }
+
+                    slot.SessionTask = null;
+                }
             }
 
             foreach (var slot in _slots)
@@ -754,7 +908,7 @@ namespace GitHub.Runner.Listener
             }
             else if (settings.UseV2Flow)
             {
-                var brokerListener = new BrokerMessageListener(settings, store, keyManager, runnerServer, brokerServer);
+                var brokerListener = new BrokerMessageListener(settings, store, keyManager, runnerServer, brokerServer, usingMigrated);
                 brokerListener.Initialize(HostContext);
                 listener = brokerListener;
             }
@@ -795,6 +949,7 @@ namespace GitHub.Runner.Listener
             slot.Dispatcher = dispatcher;
             slot.State = SlotState.Paused;
             slot.UsingMigratedSettings = usingMigrated;
+            slot.NeedsRebuild = false;
         }
 
         private void RebuildSlot(Slot slot, bool preferMigratedSettings)

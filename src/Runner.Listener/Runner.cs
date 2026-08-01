@@ -167,15 +167,18 @@ namespace GitHub.Runner.Listener
                 // remove config files, remove service, and exit
                 if (command.Remove)
                 {
-                    // only remove local config files and exit
-                    if (command.RemoveLocalConfig)
-                    {
-                        configManager.DeleteLocalRunnerConfig();
-                        return Constants.Runner.ReturnCode.Success;
-                    }
                     try
                     {
-                        await configManager.UnconfigureAsync(command);
+                        if (command.RemoveLocalConfig)
+                        {
+                            // only remove local config files and exit; --url selects
+                            // the registration when several are configured
+                            configManager.DeleteLocalRunnerConfig(command);
+                        }
+                        else
+                        {
+                            await configManager.UnconfigureAsync(command);
+                        }
                         return Constants.Runner.ReturnCode.Success;
                     }
                     catch (Exception ex)

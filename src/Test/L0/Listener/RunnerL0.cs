@@ -658,7 +658,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 await runner.ExecuteCommand(command);
 
                 // verify that we delete the local runner config with the correct remove parameter
-                _configurationManager.Verify(x => x.DeleteLocalRunnerConfig(), Times.Once());
+                _configurationManager.Verify(x => x.DeleteLocalRunnerConfig(command), Times.Once());
             }
         }
 
