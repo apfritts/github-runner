@@ -234,6 +234,12 @@ namespace GitHub.Runner.Listener
                 var base64JitConfig = command.GetJitConfig();
                 if (!string.IsNullOrEmpty(base64JitConfig))
                 {
+                    if (HostContext.GetService<IRegistrationStore>().IsMultiLayout())
+                    {
+                        _term.WriteError("--jitconfig is not supported when the runner is configured for multiple repositories.");
+                        return Constants.Runner.ReturnCode.TerminatedError;
+                    }
+
                     try
                     {
                         var decodedJitConfig = Encoding.UTF8.GetString(Convert.FromBase64String(base64JitConfig));
@@ -311,6 +317,12 @@ namespace GitHub.Runner.Listener
 
                     if (command.RunOnce)
                     {
+                        if (HostContext.GetService<IRegistrationStore>().IsMultiLayout())
+                        {
+                            _term.WriteError("--once is not supported when the runner is configured for multiple repositories.");
+                            return Constants.Runner.ReturnCode.TerminatedError;
+                        }
+
                         _term.WriteLine("Warning: '--once' is going to be deprecated in the future, please consider using '--ephemeral' during runner registration.", ConsoleColor.Yellow);
                         _term.WriteLine("https://docs.github.com/en/actions/hosting-your-own-runners/autoscaling-with-self-hosted-runners#using-ephemeral-runners-for-autoscaling", ConsoleColor.Yellow);
                     }

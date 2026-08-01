@@ -49,7 +49,10 @@ namespace GitHub.Runner.Common
         public override void Initialize(IHostContext hostContext)
         {
             base.Initialize(hostContext);
-            RootDirectory = hostContext.GetDirectory(WellKnownDirectory.Root);
+            if (string.IsNullOrEmpty(RootDirectory))
+            {
+                RootDirectory = hostContext.GetDirectory(WellKnownDirectory.Root);
+            }
         }
 
         public IReadOnlyList<RegistrationRef> GetAll()

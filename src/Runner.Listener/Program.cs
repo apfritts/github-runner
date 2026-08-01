@@ -18,9 +18,49 @@ namespace GitHub.Runner.Listener
             // Add environment variables from .env file
             LoadAndSetEnv();
 
+            // With the multi-repository layout, default this process to the first
+            // registration so single-config code paths (settings, credentials,
+            // work folder) resolve before the per-registration machinery engages.
+            SetDefaultActiveConfig();
+
             using (HostContext context = new("Runner"))
             {
                 return MainAsync(context, args).GetAwaiter().GetResult();
+            }
+        }
+
+        private static void SetDefaultActiveConfig()
+        {
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(Constants.MultiConfig.ActiveConfigEnvVar)))
+            {
+                return;
+            }
+
+            var binDir = Path.GetDirectoryName(Assembly.GetEntryAssembly().Location);
+            var rootDir = new DirectoryInfo(binDir).Parent.FullName;
+            var registrationsRoot = Path.Combine(rootDir, Constants.MultiConfig.RegistrationsDirectory);
+            if (!Directory.Exists(registrationsRoot))
+            {
+                return;
+            }
+
+            string first = null;
+            foreach (var dir in Directory.EnumerateDirectories(registrationsRoot))
+            {
+                if (!File.Exists(Path.Combine(dir, ".runner")) && !File.Exists(Path.Combine(dir, ".runner_migrated")))
+                {
+                    continue;
+                }
+
+                if (first == null || string.CompareOrdinal(dir, first) < 0)
+                {
+                    first = dir;
+                }
+            }
+
+            if (first != null)
+            {
+                Environment.SetEnvironmentVariable(Constants.MultiConfig.ActiveConfigEnvVar, Path.GetFileName(first));
             }
         }
 

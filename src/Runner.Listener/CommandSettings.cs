@@ -58,6 +58,7 @@ namespace GitHub.Runner.Listener
                 {
                     Constants.Runner.CommandLine.Args.Token,
                     Constants.Runner.CommandLine.Args.PAT,
+                    Constants.Runner.CommandLine.Args.Url,
                     Constants.Runner.CommandLine.Flags.Local
                 },
             // Valid run flags and args
