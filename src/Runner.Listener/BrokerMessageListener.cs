@@ -43,6 +43,8 @@ namespace GitHub.Runner.Listener
         private int _migratedSettingsRetryCount = 0;
         private readonly IConfigurationStore _injectedStore;
         private readonly IRSAKeyManager _injectedKeyManager;
+        private readonly IRunnerServer _injectedRunnerServer;
+        private readonly IBrokerServer _injectedBrokerServer;
 
         public BrokerMessageListener()
         {
@@ -58,11 +60,15 @@ namespace GitHub.Runner.Listener
         // store and RSA key are supplied so several broker listeners can hold
         // independent sessions (a broker connection can own only one session,
         // since DELETE /session identifies the runner via the credential JWT).
-        public BrokerMessageListener(RunnerSettings settings, IConfigurationStore store, IRSAKeyManager keyManager)
+        // Server instances may be shared with the registration's job
+        // dispatcher; when omitted, fresh instances are created.
+        public BrokerMessageListener(RunnerSettings settings, IConfigurationStore store, IRSAKeyManager keyManager, IRunnerServer runnerServer = null, IBrokerServer brokerServer = null)
         {
             _settings = settings;
             _injectedStore = store;
             _injectedKeyManager = keyManager;
+            _injectedRunnerServer = runnerServer;
+            _injectedBrokerServer = brokerServer;
         }
 
         public override void Initialize(IHostContext hostContext)
@@ -72,8 +78,8 @@ namespace GitHub.Runner.Listener
             _term = HostContext.GetService<ITerminal>();
             if (_injectedStore != null)
             {
-                _runnerServer = HostContext.CreateService<IRunnerServer>();
-                _brokerServer = HostContext.CreateService<IBrokerServer>();
+                _runnerServer = _injectedRunnerServer ?? HostContext.CreateService<IRunnerServer>();
+                _brokerServer = _injectedBrokerServer ?? HostContext.CreateService<IBrokerServer>();
             }
             else
             {

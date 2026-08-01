@@ -103,7 +103,14 @@ namespace GitHub.Runner.Common
 
         public bool IsMultiLayout()
         {
-            return EnumerateRegistrationDirectories().Any();
+            return IsMultiLayoutAt(RootDirectory);
+        }
+
+        public static bool IsMultiLayoutAt(string rootDirectory)
+        {
+            var registrationsRoot = Path.Combine(rootDirectory, Constants.MultiConfig.RegistrationsDirectory);
+            return Directory.Exists(registrationsRoot) &&
+                Directory.EnumerateDirectories(registrationsRoot).Any(IsOccupied);
         }
 
         public RegistrationRef Find(string gitHubUrl)

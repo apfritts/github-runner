@@ -234,7 +234,7 @@ namespace GitHub.Runner.Listener
                 var base64JitConfig = command.GetJitConfig();
                 if (!string.IsNullOrEmpty(base64JitConfig))
                 {
-                    if (HostContext.GetService<IRegistrationStore>().IsMultiLayout())
+                    if (RegistrationStore.IsMultiLayoutAt(HostContext.GetDirectory(WellKnownDirectory.Root)))
                     {
                         _term.WriteError("--jitconfig is not supported when the runner is configured for multiple repositories.");
                         return Constants.Runner.ReturnCode.TerminatedError;
@@ -317,7 +317,7 @@ namespace GitHub.Runner.Listener
 
                     if (command.RunOnce)
                     {
-                        if (HostContext.GetService<IRegistrationStore>().IsMultiLayout())
+                        if (RegistrationStore.IsMultiLayoutAt(HostContext.GetDirectory(WellKnownDirectory.Root)))
                         {
                             _term.WriteError("--once is not supported when the runner is configured for multiple repositories.");
                             return Constants.Runner.ReturnCode.TerminatedError;
@@ -338,6 +338,16 @@ namespace GitHub.Runner.Listener
 
                     // hosted runner only run one job and would like to know the result of the job for telemetry and alerting on failure spike.
                     var returnJobResultForHosted = StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED"));
+
+                    // Multiple repository registrations are served by one process
+                    // via the coordinator; the classic single-registration loop is
+                    // untouched otherwise.
+                    if (RegistrationStore.IsMultiLayoutAt(HostContext.GetDirectory(WellKnownDirectory.Root)))
+                    {
+                        Trace.Info("Multi-repository layout detected; starting the multi-registration coordinator.");
+                        var coordinator = HostContext.GetService<IMultiRunnerCoordinator>();
+                        return await coordinator.RunAsync();
+                    }
 
                     // Run the runner interactively or as service
                     return await ExecuteRunnerAsync(settings, command.RunOnce || settings.Ephemeral || returnJobResultForHosted, returnJobResultForHosted);

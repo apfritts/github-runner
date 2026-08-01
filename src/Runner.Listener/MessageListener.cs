@@ -62,6 +62,8 @@ namespace GitHub.Runner.Listener
         private readonly RunnerSettings _injectedSettings;
         private readonly IConfigurationStore _injectedStore;
         private readonly IRSAKeyManager _injectedKeyManager;
+        private readonly IRunnerServer _injectedRunnerServer;
+        private readonly IBrokerServer _injectedBrokerServer;
 
         public MessageListener()
         {
@@ -69,12 +71,16 @@ namespace GitHub.Runner.Listener
 
         // Per-registration listener for the multi-repository layout: settings,
         // config store, and RSA key are supplied instead of loaded from the
-        // process-wide singletons, so several listeners can coexist.
-        public MessageListener(RunnerSettings settings, IConfigurationStore store, IRSAKeyManager keyManager)
+        // process-wide singletons, so several listeners can coexist. Server
+        // instances may be shared with the registration's job dispatcher; when
+        // omitted, fresh instances are created.
+        public MessageListener(RunnerSettings settings, IConfigurationStore store, IRSAKeyManager keyManager, IRunnerServer runnerServer = null, IBrokerServer brokerServer = null)
         {
             _injectedSettings = settings;
             _injectedStore = store;
             _injectedKeyManager = keyManager;
+            _injectedRunnerServer = runnerServer;
+            _injectedBrokerServer = brokerServer;
         }
 
         public override void Initialize(IHostContext hostContext)
@@ -84,10 +90,10 @@ namespace GitHub.Runner.Listener
             _term = HostContext.GetService<ITerminal>();
             if (_injectedSettings != null)
             {
-                // Fresh server connections per listener so each can hold its own
+                // Per-listener server connections so each can hold its own
                 // session against its own registration's URL and credentials.
-                _runnerServer = HostContext.CreateService<IRunnerServer>();
-                _brokerServer = hostContext.CreateService<IBrokerServer>();
+                _runnerServer = _injectedRunnerServer ?? HostContext.CreateService<IRunnerServer>();
+                _brokerServer = _injectedBrokerServer ?? hostContext.CreateService<IBrokerServer>();
             }
             else
             {
