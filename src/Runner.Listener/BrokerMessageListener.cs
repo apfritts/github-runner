@@ -41,6 +41,8 @@ namespace GitHub.Runner.Listener
         private bool _isMigratedSettings = false;
         private const int _maxMigratedSettingsRetries = 3;
         private int _migratedSettingsRetryCount = 0;
+        private readonly IConfigurationStore _injectedStore;
+        private readonly IRSAKeyManager _injectedKeyManager;
 
         public BrokerMessageListener()
         {
@@ -52,14 +54,40 @@ namespace GitHub.Runner.Listener
             _isMigratedSettings = isMigratedSettings;
         }
 
+        // Per-registration listener for the multi-repository layout: the config
+        // store and RSA key are supplied so several broker listeners can hold
+        // independent sessions (a broker connection can own only one session,
+        // since DELETE /session identifies the runner via the credential JWT).
+        public BrokerMessageListener(RunnerSettings settings, IConfigurationStore store, IRSAKeyManager keyManager)
+        {
+            _settings = settings;
+            _injectedStore = store;
+            _injectedKeyManager = keyManager;
+        }
+
         public override void Initialize(IHostContext hostContext)
         {
             base.Initialize(hostContext);
 
             _term = HostContext.GetService<ITerminal>();
-            _runnerServer = HostContext.GetService<IRunnerServer>();
-            _brokerServer = HostContext.GetService<IBrokerServer>();
+            if (_injectedStore != null)
+            {
+                _runnerServer = HostContext.CreateService<IRunnerServer>();
+                _brokerServer = HostContext.CreateService<IBrokerServer>();
+            }
+            else
+            {
+                _runnerServer = HostContext.GetService<IRunnerServer>();
+                _brokerServer = HostContext.GetService<IBrokerServer>();
+            }
             _credMgr = HostContext.GetService<ICredentialManager>();
+        }
+
+        private VssCredentials LoadCredentials(bool allowAuthUrlV2)
+        {
+            return _injectedStore != null
+                ? _credMgr.LoadCredentials(allowAuthUrlV2, _injectedStore, _injectedKeyManager)
+                : _credMgr.LoadCredentials(allowAuthUrlV2);
         }
 
         public async Task<CreateSessionResult> CreateSessionAsync(CancellationToken token)
@@ -93,7 +121,7 @@ namespace GitHub.Runner.Listener
 
             // Create connection.
             Trace.Info("Loading Credentials");
-            _creds = _credMgr.LoadCredentials(allowAuthUrlV2: false);
+            _creds = LoadCredentials(allowAuthUrlV2: false);
 
             var agent = new TaskAgentReference
             {
@@ -116,7 +144,7 @@ namespace GitHub.Runner.Listener
                 try
                 {
                     Trace.Info("Connecting to the Broker Server...");
-                    _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+                    _credsV2 = LoadCredentials(allowAuthUrlV2: true);
                     await _brokerServer.ConnectAsync(new Uri(serverUrlV2), _credsV2);
                     Trace.Info("VssConnection created");
 
@@ -536,7 +564,7 @@ namespace GitHub.Runner.Listener
         private async Task RefreshBrokerConnectionAsync()
         {
             Trace.Info("Reload credentials.");
-            _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+            _credsV2 = LoadCredentials(allowAuthUrlV2: true);
             await _brokerServer.ConnectAsync(new Uri(_settings.ServerUrlV2), _credsV2);
             Trace.Info("Connection to Broker Server recreated.");
         }

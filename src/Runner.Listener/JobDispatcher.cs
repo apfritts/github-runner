@@ -62,13 +62,34 @@ namespace GitHub.Runner.Listener
 
         private bool _isRunServiceJob;
 
+        private readonly RunnerSettings _injectedSettings;
+        private readonly IRunnerServer _injectedRunnerServer;
+        private readonly IConfigurationStore _injectedStore;
+
+        // Extra environment variables for the spawned Runner.Worker process.
+        // The multi-repository supervisor uses this to tell the worker which
+        // registration under .runners/<slug>/ the job belongs to.
+        public IDictionary<string, string> WorkerEnvironment { get; set; }
+
+        public JobDispatcher()
+        {
+        }
+
+        // Per-registration dispatcher for the multi-repository layout.
+        public JobDispatcher(RunnerSettings settings, IRunnerServer runnerServer, IConfigurationStore store)
+        {
+            _injectedSettings = settings;
+            _injectedRunnerServer = runnerServer;
+            _injectedStore = store;
+        }
+
         public override void Initialize(IHostContext hostContext)
         {
             base.Initialize(hostContext);
 
             // get pool id from config
-            _configurationStore = hostContext.GetService<IConfigurationStore>();
-            _runnerSettings = _configurationStore.GetSettings();
+            _configurationStore = _injectedStore ?? hostContext.GetService<IConfigurationStore>();
+            _runnerSettings = _injectedSettings ?? _configurationStore.GetSettings();
             _poolId = _runnerSettings.PoolId;
 
             int channelTimeoutSeconds;
@@ -265,7 +286,7 @@ namespace GitHub.Runner.Listener
                 //    properly but thinks it still owns the job reqest, however the server has already abandoned the jobrequest.
                 // 2. a server bug or design change that allowed the server to send more than one job request to an given runner that hasn't finished
                 //.   a previous job request.
-                var runnerServer = HostContext.GetService<IRunnerServer>();
+                var runnerServer = _injectedRunnerServer ?? HostContext.GetService<IRunnerServer>();
                 TaskAgentJobRequest request = null;
                 try
                 {
@@ -478,7 +499,7 @@ namespace GitHub.Runner.Listener
                                     workingDirectory: assemblyDirectory,
                                     fileName: workerFileName,
                                     arguments: "spawnclient " + pipeHandleOut + " " + pipeHandleIn,
-                                    environment: null,
+                                    environment: WorkerEnvironment,
                                     requireExitCodeZero: false,
                                     outputEncoding: null,
                                     killProcessOnCancel: true,
@@ -740,7 +761,7 @@ namespace GitHub.Runner.Listener
             }
             else
             {
-                var runnerServer = HostContext.GetService<IRunnerServer>();
+                var runnerServer = _injectedRunnerServer ?? HostContext.GetService<IRunnerServer>();
                 await RenewJobRequestAsync(runnerServer, poolId, requestId, lockToken, orchestrationId, firstJobRequestRenewed, token);
             }
         }
@@ -1127,7 +1148,7 @@ namespace GitHub.Runner.Listener
                 return;
             }
 
-            var runnerServer = HostContext.GetService<IRunnerServer>();
+            var runnerServer = _injectedRunnerServer ?? HostContext.GetService<IRunnerServer>();
             int completeJobRequestRetryLimit = 5;
             List<Exception> exceptions = new();
             while (completeJobRequestRetryLimit-- > 0)
