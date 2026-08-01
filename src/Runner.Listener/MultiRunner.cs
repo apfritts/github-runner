@@ -56,12 +56,14 @@ namespace GitHub.Runner.Listener
         }
 
         private static readonly TimeSpan SessionRetryDelay = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan VersionCheckInterval = TimeSpan.FromHours(24);
 
         private readonly List<Slot> _slots = new();
         private ITerminal _term;
         private IErrorThrottler _acquireJobThrottler;
         private Slot _busySlot;
         private TaskCompletionSource<object> _jobIdleSignal;
+        private DateTime _nextVersionCheckUtc = DateTime.MinValue;
 
         // Test hooks: override construction of per-registration collaborators.
         public Func<RunnerSettings, IConfigurationStore, IRSAKeyManager, IRunnerServer, IBrokerServer, IMessageListener> ListenerFactory { get; set; }
@@ -155,6 +157,15 @@ namespace GitHub.Runner.Listener
                     {
                         await CreateSessionForSlotAsync(slot, shutdownToken);
                     }
+
+                    // With automatic updates disabled, warn periodically when a
+                    // newer runner version exists so this fork gets rebased
+                    // before GitHub starts refusing the old version.
+                    if (DateTime.UtcNow >= _nextVersionCheckUtc)
+                    {
+                        _nextVersionCheckUtc = DateTime.UtcNow + VersionCheckInterval;
+                        _ = CheckRunnerVersionAsync(shutdownToken);
+                    }
                 }
 
                 foreach (var slot in _slots.Where(x => x.State == SlotState.Listening && x.PollTask == null))
@@ -242,6 +253,14 @@ namespace GitHub.Runner.Listener
                 catch (HostedRunnerDeprovisionedException)
                 {
                     Trace.Info($"[{winner.DisplayName}] Hosted runner has been deprovisioned.");
+                    winner.State = SlotState.Dead;
+                    continue;
+                }
+                catch (AccessDeniedException ex) when (ex.ErrorCode == 1)
+                {
+                    // The service refuses runners below its minimum version.
+                    Trace.Error(ex);
+                    _term.WriteError($"GitHub rejected runner version {BuildConstants.RunnerPackage.Version} for {winner.DisplayName} as too old. Automatic updates are disabled in multi-repository mode - rebase and rebuild this fork to continue.");
                     winner.State = SlotState.Dead;
                     continue;
                 }
@@ -788,6 +807,52 @@ namespace GitHub.Runner.Listener
             if (e.Status == TaskAgentStatus.Online && ReferenceEquals(slot, _busySlot))
             {
                 _jobIdleSignal?.TrySetResult(null);
+            }
+        }
+
+        // Best-effort: compare the running version against the newest package the
+        // service offers and warn when behind. Never fails the runner.
+        private async Task CheckRunnerVersionAsync(CancellationToken token)
+        {
+            try
+            {
+                foreach (var slot in _slots.Where(x => x.State == SlotState.Listening).ToList())
+                {
+                    List<PackageMetadata> packages;
+                    try
+                    {
+                        packages = await slot.RunnerServer.GetPackagesAsync("agent", BuildConstants.RunnerPackage.PackageName, 1, false, token);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Broker-only registrations may not serve the package API.
+                        Trace.Info($"[{slot.DisplayName}] Package version check not available: {ex.Message}");
+                        continue;
+                    }
+
+                    var latest = packages?.FirstOrDefault();
+                    if (latest == null)
+                    {
+                        continue;
+                    }
+
+                    var serverVersion = new PackageVersion(latest.Version);
+                    var currentVersion = new PackageVersion(BuildConstants.RunnerPackage.Version);
+                    if (serverVersion.CompareTo(currentVersion) > 0)
+                    {
+                        _term.WriteLine($"{DateTime.UtcNow:u}: Warning: this runner is version {BuildConstants.RunnerPackage.Version} but the latest runner version is {latest.Version}. Automatic updates are disabled in multi-repository mode - rebase and rebuild this fork, or GitHub may eventually refuse this version.", ConsoleColor.Yellow);
+                    }
+                    else
+                    {
+                        Trace.Info($"Runner version {BuildConstants.RunnerPackage.Version} is current (latest available: {latest.Version}).");
+                    }
+
+                    return;
+                }
+            }
+            catch (Exception)
+            {
+                // Version awareness must never take the runner down.
             }
         }
     }
