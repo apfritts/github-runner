@@ -184,6 +184,13 @@ namespace GitHub.Runner.Common
                 public static readonly string SelfRepository = "actions_self_repository";
             }
 
+            // Categories reported to the service alongside an infrastructure failure so
+            // it can distinguish between the different ways runner infrastructure fails.
+            public static class InfrastructureFailureCategories
+            {
+                public static readonly string DebuggerTunnelFailure = "debugger_tunnel_failure";
+            }
+
             // Node version migration related constants
             public static class NodeMigration
             {
@@ -209,7 +216,7 @@ namespace GitHub.Runner.Common
 
                 // Node 20 migration dates (hardcoded fallbacks, can be overridden via job variables)
                 public static readonly string Node24DefaultDate = "June 16th, 2026";
-                public static readonly string Node20RemovalDate = "September 16th, 2026";
+                public static readonly string Node20RemovalDate = "September 23rd, 2026";
 
                 // Variable keys for server-overridable dates
                 public static readonly string Node24DefaultDateVariable = "actions_runner_node24_default_date";
